@@ -8,15 +8,19 @@ WORKDIR=$(pwd)
 CMAKE_VERSION=3.30.5
 CMAKE_REQUIRED_VERSION=3.30.5
 
-dnf install -y make cmake ninja-build libomp-devel \
+dnf install -y make gcc-toolset-13 cmake ninja-build libomp-devel \
                git python${PYTHON_VERSION} python${PYTHON_VERSION}-devel python${PYTHON_VERSION}-pip \
                openssl openssl-devel zlib-devel libuuid-devel 
 
-export CC=gcc
-export CXX=g++
-export CXXFLAGS="-std=c++17 -mcmodel=medium -ffunction-sections"
+
+source /opt/rh/gcc-toolset-13/enable
+export CXX=/opt/rh/gcc-toolset-13/root/usr/bin/g++
 export CFLAGS="-mcmodel=medium -ffunction-sections"
 export LDFLAGS="-Wl,--stub-group-size=0x00002000 -Wl,--gc-sections"
+
+# GCC toolset 13 does not include libatomic, causing '-latomic not found' during linking.
+# Symlink the system-provided libatomic.so.1 so the compiler can resolve it.
+ln -s /usr/lib64/libatomic.so.1   /opt/rh/gcc-toolset-13/root/usr/lib/gcc/ppc64le-redhat-linux/13/libatomic.so
 
 # Ensure CXXFLAGS and LINKFLAGS are initialized
 : "${CMAKE_ARGS:=""}"
@@ -97,13 +101,17 @@ cd ../../..
 # Build Milvus-Lite  (Python package)
 #######################################################
 echo "Building milvus-lite..."
+dnf remove -y gcc-toolset-13
 dnf install -y perl ncurses-devel wget openblas-devel cargo gcc gcc-c++ libstdc++-static which libaio \
                libtool m4 autoconf automake zlib-devel libffi-devel scl-utils xz
 
+export CC=gcc
+export CXX=g++
+export CXXFLAGS="-std=c++17"
+
 python${PYTHON_VERSION} -m pip install conan==1.64.1 setuptools==70.0.0
 
-git clone https://github.com/milvus-io/milvus-lite
+git clone -b v2.4.12 https://github.com/milvus-io/milvus-lite.git
 cd milvus-lite/python
-git checkout v2.4.12
 git submodule update --init --recursive
 python${PYTHON_VERSION} -m pip install -v -e .
