@@ -63,6 +63,7 @@ REQUIRED = [
     "aiohttp>=3.13.3",
     "python-multipart>=0.0.22",
     "pyOpenSSL>=26.0.0",
+    "idna>=3.10",
 ]
 
 GCP_REQUIRED = [
