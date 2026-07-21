@@ -40,6 +40,7 @@ REQUIRED = [
     "numpy>=2.0.0,<3",
     "pandas>=1.4.3,<3",
     "pyarrow>=21.0.0",
+    "pyasn1>=0.6.4",
     "pydantic>=2.0.0",
     "pygments>=2.12.0,<3",
     "PyYAML>=5.4.0,<7",
