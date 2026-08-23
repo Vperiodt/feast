@@ -48,6 +48,24 @@ class DatasetSyncConfig(FeastBaseModel):
         Defaults to 10000. """
 
 
+DEFAULT_REQUEST_TIMEOUT = 30
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_RETRY_BACKOFF_FACTOR = 1.0
+
+
+def resolve_ui_url(configured_url: Optional[str] = None) -> Optional[str]:
+    """Return the browser-reachable MLflow UI URL for hyperlinks.
+
+    Priority:
+      1. Explicitly configured ui_url from feature_store.yaml
+      2. MLFLOW_UI_URL environment variable
+      3. None — callers fall back to tracking_uri (works for local dev)
+    """
+    if configured_url:
+        return configured_url
+    return os.environ.get("MLFLOW_UI_URL")
+
+
 class MlflowConfig(FeastBaseModel):
     enabled: StrictBool = False
     """ bool: Whether MLflow integration is enabled. Defaults to False. """
@@ -56,6 +74,13 @@ class MlflowConfig(FeastBaseModel):
     """ str: MLflow tracking URI. When not set, the MLFLOW_TRACKING_URI
         environment variable is used. If neither is set, MLflow falls back
         to its own default (local ./mlruns directory). """
+
+    ui_url: Optional[StrictStr] = None
+    """ str: Browser-reachable MLflow UI URL used for hyperlinks in Feast UI
+        lineage pages. When not set, the MLFLOW_UI_URL environment variable
+        is used. If neither is set, falls back to tracking_uri. On
+        operator-managed deployments, this is auto-discovered from the MLflow
+        CR status.url (the external gateway route). """
 
     auto_log: StrictBool = True
     """ bool: Automatically log feature retrieval metadata to the active
@@ -93,6 +118,30 @@ class MlflowConfig(FeastBaseModel):
     """ list[str]: Artifact formats the MlflowDatasetSource adapter will
         accept.  Unsupported formats raise a clear error at validation time. """
 
+    request_timeout: StrictInt = DEFAULT_REQUEST_TIMEOUT
+    """ int: Timeout in seconds for individual HTTP requests to the MLflow
+        tracking server. Applies to artifact downloads and GenAI dataset
+        fetches. Defaults to 30. """
+
+    max_retries: StrictInt = DEFAULT_MAX_RETRIES
+    """ int: Maximum number of retry attempts for transient MLflow API
+        failures (timeouts, 5xx, connection errors). Uses exponential
+        backoff. Defaults to 3. """
+
+    retry_backoff_factor: float = DEFAULT_RETRY_BACKOFF_FACTOR
+    """ float: Base factor for exponential backoff between retries.
+        Wait time = backoff_factor * (2 ** attempt). Defaults to 1.0,
+        giving waits of 1s, 2s, 4s. """
+
     def get_tracking_uri(self) -> Optional[str]:
         """Resolve the effective tracking URI for this config instance."""
         return resolve_tracking_uri(self.tracking_uri)
+
+    def get_ui_url(self) -> Optional[str]:
+        """Resolve the browser-reachable UI URL for lineage hyperlinks.
+
+        Falls back to tracking_uri when no explicit ui_url is configured,
+        which is correct for local/non-operator deployments where the
+        tracking URI is already browser-reachable.
+        """
+        return resolve_ui_url(self.ui_url) or self.get_tracking_uri()

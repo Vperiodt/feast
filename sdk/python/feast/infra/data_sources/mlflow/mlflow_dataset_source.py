@@ -357,16 +357,63 @@ class MlflowDatasetSource(DataSource):
         return table
 
     def _fetch_arrow(self) -> pa.Table:
-        """Internal: download data from MLflow and return as PyArrow Table."""
-        from feast.infra.data_sources.mlflow.auth import resolve_mlflow_token
+        """Internal: download data from MLflow with retry and error classification."""
+        import time
+
+        from feast.infra.data_sources.mlflow.auth import (
+            MlflowArtifactNotFoundError,
+            MlflowAuthError,
+            classify_mlflow_error,
+            is_retryable_error,
+            resolve_mlflow_token,
+        )
+        from feast.mlflow_integration.config import (
+            DEFAULT_MAX_RETRIES,
+            DEFAULT_RETRY_BACKOFF_FACTOR,
+        )
 
         tracking_uri = self.get_effective_tracking_uri()
         token = resolve_mlflow_token()
+        max_retries = DEFAULT_MAX_RETRIES
+        backoff_factor = DEFAULT_RETRY_BACKOFF_FACTOR
 
-        if self.is_genai_mode:
-            return self._fetch_genai_arrow(token, tracking_uri)
-        else:
-            return self._fetch_artifact_arrow(token, tracking_uri)
+        last_exc: Optional[Exception] = None
+        for attempt in range(max_retries):
+            try:
+                if self.is_genai_mode:
+                    return self._fetch_genai_arrow(token, tracking_uri)
+                else:
+                    return self._fetch_artifact_arrow(token, tracking_uri)
+            except (MlflowArtifactNotFoundError, MlflowAuthError):
+                raise
+            except Exception as e:
+                classified = classify_mlflow_error(e)
+                if isinstance(
+                    classified, (MlflowArtifactNotFoundError, MlflowAuthError)
+                ):
+                    raise classified from e
+                if not is_retryable_error(e) or attempt == max_retries - 1:
+                    last_exc = e
+                    break
+                wait = backoff_factor * (2**attempt)
+                logger.warning(
+                    "MLflow fetch attempt %d/%d failed for '%s': %s "
+                    "(retrying in %.1fs)",
+                    attempt + 1,
+                    max_retries,
+                    self.name,
+                    e,
+                    wait,
+                )
+                time.sleep(wait)
+                last_exc = e
+
+        from feast.infra.data_sources.mlflow.auth import MlflowConnectionError
+
+        raise MlflowConnectionError(
+            f"Failed to fetch data from MLflow for source '{self.name}' "
+            f"after {max_retries} attempts. Last error: {last_exc}"
+        ) from last_exc
 
     def _fetch_genai_arrow(
         self, token: Optional[str], tracking_uri: Optional[str]
@@ -380,11 +427,25 @@ class MlflowDatasetSource(DataSource):
                 "in GenAI Dataset mode."
             ) from e
 
-        from feast.infra.data_sources.mlflow.auth import mlflow_request_scope
+        from feast.infra.data_sources.mlflow.auth import (
+            MlflowArtifactNotFoundError,
+            classify_mlflow_error,
+            mlflow_request_scope,
+        )
 
         with mlflow_request_scope(token, tracking_uri):
             name = self.dataset_name or self.dataset_id
-            dataset = mlflow.genai.datasets.get_dataset(name=name)
+            try:
+                dataset = mlflow.genai.datasets.get_dataset(name=name)
+            except Exception as e:
+                classified = classify_mlflow_error(e)
+                if isinstance(classified, MlflowArtifactNotFoundError):
+                    raise MlflowArtifactNotFoundError(
+                        f"MLflow GenAI dataset '{name}' not found. "
+                        f"Verify the dataset exists and has not been deleted. "
+                        f"Source: '{self.name}'."
+                    ) from e
+                raise
             df = dataset.to_df()
 
         try:
@@ -412,15 +473,31 @@ class MlflowDatasetSource(DataSource):
         import pyarrow.csv as pa_csv
         import pyarrow.parquet as pq
 
-        from feast.infra.data_sources.mlflow.auth import mlflow_request_scope
+        from feast.infra.data_sources.mlflow.auth import (
+            MlflowArtifactNotFoundError,
+            classify_mlflow_error,
+            mlflow_request_scope,
+        )
 
         with mlflow_request_scope(token, tracking_uri):
             with tempfile.TemporaryDirectory(prefix="feast_mlflow_") as tmpdir:
-                local_path = mlflow.artifacts.download_artifacts(
-                    run_id=self.run_id,
-                    artifact_path=self.artifact_path,
-                    dst_path=tmpdir,
-                )
+                try:
+                    local_path = mlflow.artifacts.download_artifacts(
+                        run_id=self.run_id,
+                        artifact_path=self.artifact_path,
+                        dst_path=tmpdir,
+                    )
+                except Exception as e:
+                    classified = classify_mlflow_error(e)
+                    if isinstance(classified, MlflowArtifactNotFoundError):
+                        raise MlflowArtifactNotFoundError(
+                            f"MLflow artifact not found: run_id='{self.run_id}', "
+                            f"artifact_path='{self.artifact_path}'. The run or "
+                            f"artifact may have been deleted. "
+                            f"Source: '{self.name}'."
+                        ) from e
+                    raise
+
                 if self.artifact_format == "parquet":
                     return pq.read_table(local_path)
                 elif self.artifact_format == "csv":

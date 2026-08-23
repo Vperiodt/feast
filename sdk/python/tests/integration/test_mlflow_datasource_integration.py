@@ -208,6 +208,209 @@ class TestArtifactModeGetHistoricalFeatures:
         assert "category" in result_df.columns
 
 
+class TestCSVArtifactModeGetHistoricalFeatures:
+    """Test CSV artifact-mode MlflowDatasetSource end-to-end with DuckDB (AC1/AC2 format matrix)."""
+
+    def test_get_historical_features_csv_artifact(self, tmp_feast_repo):
+        """Verify CSV format works through the full retrieval path."""
+        tmp_path, feature_path, _, _, entity_df = tmp_feast_repo
+
+        now = datetime.now(tz=timezone.utc)
+        expected_data = pa.table(
+            {
+                "record_id": ["r1", "r2", "r3"],
+                "score": [0.9, 0.8, 0.95],
+                "category": ["A", "B", "A"],
+                "event_timestamp": [
+                    now - timedelta(hours=3),
+                    now - timedelta(hours=2),
+                    now - timedelta(hours=1),
+                ],
+            }
+        )
+
+        batch_source = FileSource(path=feature_path, timestamp_field="event_timestamp")
+        mlflow_src = MlflowDatasetSource(
+            name="csv_artifact_src",
+            run_id="test-run-csv",
+            artifact_path="outputs/data.csv",
+            artifact_format="csv",
+            batch_source=batch_source,
+            timestamp_field="event_timestamp",
+        )
+
+        entity = Entity(
+            name="record_id",
+            join_keys=["record_id"],
+            value_type=ValueType.STRING,
+        )
+        fv = FeatureView(
+            name="csv_artifact_features",
+            entities=[entity],
+            schema=[
+                Field(name="score", dtype=Float64),
+                Field(name="category", dtype=String),
+            ],
+            source=mlflow_src,
+            ttl=timedelta(days=1),
+        )
+
+        config = RepoConfig(
+            project="test_csv_project",
+            registry=str(tmp_path / "registry_csv.db"),
+            provider="local",
+            online_store=SqliteOnlineStoreConfig(path=str(tmp_path / "online_csv.db")),
+            offline_store="duckdb",
+            entity_key_serialization_version=3,
+        )
+
+        store = FeatureStore(config=config)
+        store.apply([entity, fv])
+
+        with patch.object(MlflowDatasetSource, "to_arrow", return_value=expected_data):
+            result = store.get_historical_features(
+                entity_df=entity_df,
+                features=[
+                    "csv_artifact_features:score",
+                    "csv_artifact_features:category",
+                ],
+            )
+            result_df = result.to_df()
+
+        assert len(result_df) == 3
+        assert "score" in result_df.columns
+        assert "category" in result_df.columns
+        assert all(result_df["score"].notna())
+
+
+class TestNonMlflowFeatureViewsUnaffected:
+    """Verify that non-MLflow FeatureViews work normally (backwards compat, AC5)."""
+
+    def test_file_source_feature_view_unaffected(self, tmp_feast_repo):
+        """Standard FileSource FeatureViews must work when MLflow integration is present."""
+        tmp_path, feature_path, _, _, entity_df = tmp_feast_repo
+
+        batch_source = FileSource(path=feature_path, timestamp_field="event_timestamp")
+
+        entity = Entity(
+            name="record_id",
+            join_keys=["record_id"],
+            value_type=ValueType.STRING,
+        )
+        fv = FeatureView(
+            name="standard_features",
+            entities=[entity],
+            schema=[
+                Field(name="score", dtype=Float64),
+                Field(name="category", dtype=String),
+            ],
+            source=batch_source,
+            ttl=timedelta(days=1),
+        )
+
+        config = RepoConfig(
+            project="test_compat_project",
+            registry=str(tmp_path / "registry_compat.db"),
+            provider="local",
+            online_store=SqliteOnlineStoreConfig(
+                path=str(tmp_path / "online_compat.db")
+            ),
+            offline_store="duckdb",
+            entity_key_serialization_version=3,
+        )
+
+        store = FeatureStore(config=config)
+        store.apply([entity, fv])
+
+        result = store.get_historical_features(
+            entity_df=entity_df,
+            features=["standard_features:score", "standard_features:category"],
+        )
+        result_df = result.to_df()
+
+        assert len(result_df) == 3
+        assert "score" in result_df.columns
+        assert "category" in result_df.columns
+        assert all(result_df["score"].notna())
+
+    def test_mixed_mlflow_and_file_sources(self, tmp_feast_repo):
+        """Both MLflow and non-MLflow FeatureViews coexist in same project."""
+        tmp_path, feature_path, _, _, entity_df = tmp_feast_repo
+
+        now = datetime.now(tz=timezone.utc)
+        mlflow_data = pa.table(
+            {
+                "record_id": ["r1", "r2", "r3"],
+                "ml_score": [0.5, 0.6, 0.7],
+                "event_timestamp": [
+                    now - timedelta(hours=3),
+                    now - timedelta(hours=2),
+                    now - timedelta(hours=1),
+                ],
+            }
+        )
+
+        batch_source = FileSource(path=feature_path, timestamp_field="event_timestamp")
+        entity = Entity(
+            name="record_id",
+            join_keys=["record_id"],
+            value_type=ValueType.STRING,
+        )
+
+        file_fv = FeatureView(
+            name="file_features",
+            entities=[entity],
+            schema=[Field(name="score", dtype=Float64)],
+            source=batch_source,
+            ttl=timedelta(days=1),
+        )
+
+        mlflow_src = MlflowDatasetSource(
+            name="mlflow_src",
+            dataset_name="eval_ds",
+            batch_source=batch_source,
+            timestamp_field="event_timestamp",
+        )
+        mlflow_fv = FeatureView(
+            name="mlflow_features",
+            entities=[entity],
+            schema=[Field(name="ml_score", dtype=Float64)],
+            source=mlflow_src,
+            ttl=timedelta(days=1),
+        )
+
+        config = RepoConfig(
+            project="test_mixed_project",
+            registry=str(tmp_path / "registry_mixed.db"),
+            provider="local",
+            online_store=SqliteOnlineStoreConfig(
+                path=str(tmp_path / "online_mixed.db")
+            ),
+            offline_store="duckdb",
+            entity_key_serialization_version=3,
+        )
+
+        store = FeatureStore(config=config)
+        store.apply([entity, file_fv, mlflow_fv])
+
+        file_result = store.get_historical_features(
+            entity_df=entity_df,
+            features=["file_features:score"],
+        )
+        file_df = file_result.to_df()
+        assert len(file_df) == 3
+        assert all(file_df["score"].notna())
+
+        with patch.object(MlflowDatasetSource, "to_arrow", return_value=mlflow_data):
+            mlflow_result = store.get_historical_features(
+                entity_df=entity_df,
+                features=["mlflow_features:ml_score"],
+            )
+            mlflow_df = mlflow_result.to_df()
+        assert len(mlflow_df) == 3
+        assert "ml_score" in mlflow_df.columns
+
+
 class TestProtoRoundTripIntegration:
     """Test that MlflowDatasetSource survives proto round-trip in a FeatureStore."""
 

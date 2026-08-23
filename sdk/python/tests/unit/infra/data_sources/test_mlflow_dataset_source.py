@@ -696,3 +696,365 @@ class TestSyncFromMlflowDatasetSource:
 
         result = _get_mlflow_dataset_source(store, "test_fv")
         assert result is src
+
+
+# ---------------------------------------------------------------------------
+# Error classification and retry behaviour
+# ---------------------------------------------------------------------------
+
+
+class TestErrorClassification:
+    """Verify typed error wrapping for MLflow failures (AC4, AC5)."""
+
+    def test_401_becomes_auth_error(self):
+        from feast.infra.data_sources.mlflow.auth import (
+            MlflowAuthError,
+            classify_mlflow_error,
+        )
+
+        exc = Exception("INVALID_PARAMETER_VALUE: Unauthorized (401)")
+        classified = classify_mlflow_error(exc)
+        assert isinstance(classified, MlflowAuthError)
+        assert "401" in str(classified)
+
+    def test_403_becomes_auth_error(self):
+        from feast.infra.data_sources.mlflow.auth import (
+            MlflowAuthError,
+            classify_mlflow_error,
+        )
+
+        exc = Exception("Forbidden (403): insufficient permissions")
+        classified = classify_mlflow_error(exc)
+        assert isinstance(classified, MlflowAuthError)
+        assert "403" in str(classified)
+
+    def test_404_becomes_not_found_error(self):
+        from feast.infra.data_sources.mlflow.auth import (
+            MlflowArtifactNotFoundError,
+            classify_mlflow_error,
+        )
+
+        exc = Exception("RESOURCE_DOES_NOT_EXIST: Run 'abc123' not found (404)")
+        classified = classify_mlflow_error(exc)
+        assert isinstance(classified, MlflowArtifactNotFoundError)
+        assert "not found" in str(classified).lower()
+
+    def test_connection_error_becomes_connection_error(self):
+        from feast.infra.data_sources.mlflow.auth import (
+            MlflowConnectionError,
+            classify_mlflow_error,
+        )
+
+        exc = ConnectionError("Connection refused")
+        classified = classify_mlflow_error(exc)
+        assert isinstance(classified, MlflowConnectionError)
+
+    def test_timeout_becomes_connection_error(self):
+        from feast.infra.data_sources.mlflow.auth import (
+            MlflowConnectionError,
+            classify_mlflow_error,
+        )
+
+        exc = TimeoutError("Read timed out")
+        classified = classify_mlflow_error(exc)
+        assert isinstance(classified, MlflowConnectionError)
+
+    def test_generic_error_passes_through(self):
+        from feast.infra.data_sources.mlflow.auth import classify_mlflow_error
+
+        exc = ValueError("some internal error")
+        classified = classify_mlflow_error(exc)
+        assert classified is exc
+
+
+class TestRetryClassification:
+    """Verify which errors are retryable (transient) vs terminal."""
+
+    def test_connection_error_is_retryable(self):
+        from feast.infra.data_sources.mlflow.auth import is_retryable_error
+
+        assert is_retryable_error(ConnectionError("refused"))
+        assert is_retryable_error(TimeoutError("timed out"))
+        assert is_retryable_error(OSError("Network unreachable"))
+
+    def test_5xx_is_retryable(self):
+        from feast.infra.data_sources.mlflow.auth import is_retryable_error
+
+        exc = Exception("Internal Server Error (500)")
+        assert is_retryable_error(exc)
+
+    def test_429_is_retryable(self):
+        from feast.infra.data_sources.mlflow.auth import is_retryable_error
+
+        exc = Exception("Too Many Requests (429)")
+        assert is_retryable_error(exc)
+
+    def test_404_is_not_retryable(self):
+        from feast.infra.data_sources.mlflow.auth import is_retryable_error
+
+        exc = Exception("Not Found (404)")
+        assert not is_retryable_error(exc)
+
+    def test_401_is_not_retryable(self):
+        from feast.infra.data_sources.mlflow.auth import is_retryable_error
+
+        exc = Exception("Unauthorized (401)")
+        assert not is_retryable_error(exc)
+
+    def test_validation_error_is_not_retryable(self):
+        from feast.infra.data_sources.mlflow.auth import is_retryable_error
+
+        exc = ValueError("invalid parameter")
+        assert not is_retryable_error(exc)
+
+
+class TestFetchArrowRetry:
+    """Verify _fetch_arrow retries transient failures then raises clear error."""
+
+    def test_retries_on_connection_error_then_succeeds(self):
+        import pyarrow as pa
+
+        src = MlflowDatasetSource(
+            name="retry_src",
+            dataset_name="ds",
+            batch_source=_batch_source(),
+        )
+        expected = pa.table({"x": [1]})
+
+        call_count = {"n": 0}
+
+        def side_effect(token, uri):
+            call_count["n"] += 1
+            if call_count["n"] < 3:
+                raise ConnectionError("Connection refused")
+            return expected
+
+        with patch.object(src, "_fetch_genai_arrow", side_effect=side_effect):
+            with patch(
+                "feast.infra.data_sources.mlflow.auth.resolve_mlflow_token",
+                return_value=None,
+            ):
+                result = src._fetch_arrow()
+                assert result.equals(expected)
+                assert call_count["n"] == 3
+
+    def test_raises_connection_error_after_max_retries(self):
+        from feast.infra.data_sources.mlflow.auth import MlflowConnectionError
+
+        src = MlflowDatasetSource(
+            name="fail_src",
+            dataset_name="ds",
+            batch_source=_batch_source(),
+        )
+
+        with patch.object(
+            src,
+            "_fetch_genai_arrow",
+            side_effect=ConnectionError("Connection refused"),
+        ):
+            with patch(
+                "feast.infra.data_sources.mlflow.auth.resolve_mlflow_token",
+                return_value=None,
+            ):
+                with pytest.raises(MlflowConnectionError, match="after 3 attempts"):
+                    src._fetch_arrow()
+
+    def test_does_not_retry_auth_errors(self):
+        from feast.infra.data_sources.mlflow.auth import MlflowAuthError
+
+        src = MlflowDatasetSource(
+            name="auth_src",
+            dataset_name="ds",
+            batch_source=_batch_source(),
+        )
+
+        call_count = {"n": 0}
+
+        def side_effect(token, uri):
+            call_count["n"] += 1
+            raise Exception("Unauthorized (401)")
+
+        with patch.object(src, "_fetch_genai_arrow", side_effect=side_effect):
+            with patch(
+                "feast.infra.data_sources.mlflow.auth.resolve_mlflow_token",
+                return_value=None,
+            ):
+                with pytest.raises(MlflowAuthError):
+                    src._fetch_arrow()
+                assert call_count["n"] == 1
+
+    def test_does_not_retry_not_found_errors(self):
+        from feast.infra.data_sources.mlflow.auth import MlflowArtifactNotFoundError
+
+        src = MlflowDatasetSource(
+            name="missing_src",
+            run_id="deleted-run",
+            artifact_path="data.parquet",
+            batch_source=_batch_source(),
+        )
+
+        call_count = {"n": 0}
+
+        def side_effect(token, uri):
+            call_count["n"] += 1
+            raise Exception("RESOURCE_DOES_NOT_EXIST: Run not found (404)")
+
+        with patch.object(src, "_fetch_artifact_arrow", side_effect=side_effect):
+            with patch(
+                "feast.infra.data_sources.mlflow.auth.resolve_mlflow_token",
+                return_value=None,
+            ):
+                with pytest.raises(MlflowArtifactNotFoundError):
+                    src._fetch_arrow()
+                assert call_count["n"] == 1
+
+
+class TestArtifactNotFound:
+    """Verify descriptive error when artifact/dataset is missing (AC criterion)."""
+
+    def test_missing_artifact_descriptive_error(self):
+        from feast.infra.data_sources.mlflow.auth import MlflowArtifactNotFoundError
+
+        src = MlflowDatasetSource(
+            name="prod_features",
+            run_id="run-xyz-123",
+            artifact_path="outputs/model_features.parquet",
+            batch_source=_batch_source(),
+        )
+
+        with patch(
+            "mlflow.artifacts.download_artifacts",
+            side_effect=Exception(
+                "RESOURCE_DOES_NOT_EXIST: Run 'run-xyz-123' not found (404)"
+            ),
+        ):
+            with patch(
+                "feast.infra.data_sources.mlflow.auth.resolve_mlflow_token",
+                return_value="token",
+            ):
+                with pytest.raises(MlflowArtifactNotFoundError) as exc_info:
+                    src._fetch_arrow()
+                assert "run-xyz-123" in str(exc_info.value)
+                assert "prod_features" in str(exc_info.value)
+
+    def test_missing_genai_dataset_descriptive_error(self):
+        from feast.infra.data_sources.mlflow.auth import MlflowArtifactNotFoundError
+
+        src = MlflowDatasetSource(
+            name="eval_source",
+            dataset_name="deleted_dataset",
+            batch_source=_batch_source(),
+        )
+
+        with patch(
+            "mlflow.genai.datasets.get_dataset",
+            side_effect=Exception(
+                "RESOURCE_DOES_NOT_EXIST: Dataset 'deleted_dataset' not found (404)"
+            ),
+        ):
+            with patch(
+                "feast.infra.data_sources.mlflow.auth.resolve_mlflow_token",
+                return_value=None,
+            ):
+                with pytest.raises(MlflowArtifactNotFoundError) as exc_info:
+                    src._fetch_arrow()
+                assert "deleted_dataset" in str(exc_info.value)
+                assert "eval_source" in str(exc_info.value)
+
+
+class TestAuthEnforcement:
+    """Verify auth errors propagate clearly (AC4)."""
+
+    def test_401_propagates_with_context(self):
+        from feast.infra.data_sources.mlflow.auth import MlflowAuthError
+
+        src = MlflowDatasetSource(
+            name="secured_src",
+            dataset_name="private_ds",
+            batch_source=_batch_source(),
+        )
+
+        with patch(
+            "mlflow.genai.datasets.get_dataset",
+            side_effect=Exception(
+                "PERMISSION_DENIED: Unauthorized (401). Token is invalid or expired."
+            ),
+        ):
+            with patch(
+                "feast.infra.data_sources.mlflow.auth.resolve_mlflow_token",
+                return_value="expired-token",
+            ):
+                with pytest.raises(MlflowAuthError) as exc_info:
+                    src._fetch_arrow()
+                assert "401" in str(exc_info.value)
+                assert "MLFLOW_TRACKING_TOKEN" in str(exc_info.value)
+
+    def test_403_propagates_with_context(self):
+        from feast.infra.data_sources.mlflow.auth import MlflowAuthError
+
+        src = MlflowDatasetSource(
+            name="restricted_src",
+            run_id="run-1",
+            artifact_path="secret.parquet",
+            batch_source=_batch_source(),
+        )
+
+        with patch(
+            "mlflow.artifacts.download_artifacts",
+            side_effect=Exception("Forbidden (403): insufficient permissions"),
+        ):
+            with patch(
+                "feast.infra.data_sources.mlflow.auth.resolve_mlflow_token",
+                return_value="valid-but-restricted",
+            ):
+                with pytest.raises(MlflowAuthError) as exc_info:
+                    src._fetch_arrow()
+                assert "403" in str(exc_info.value)
+                assert "permission" in str(exc_info.value).lower()
+
+
+class TestCABundleScope:
+    """Verify CA bundle context manager for TLS."""
+
+    def test_ca_bundle_sets_and_restores_env(self):
+        from feast.infra.data_sources.mlflow.auth import mlflow_ca_bundle_scope
+
+        original = os.environ.get("REQUESTS_CA_BUNDLE")
+        with mlflow_ca_bundle_scope("/etc/pki/custom-ca.crt"):
+            assert os.environ["REQUESTS_CA_BUNDLE"] == "/etc/pki/custom-ca.crt"
+        assert os.environ.get("REQUESTS_CA_BUNDLE") == original
+
+    def test_ca_bundle_none_is_noop(self):
+        from feast.infra.data_sources.mlflow.auth import mlflow_ca_bundle_scope
+
+        original = os.environ.get("REQUESTS_CA_BUNDLE")
+        with mlflow_ca_bundle_scope(None):
+            assert os.environ.get("REQUESTS_CA_BUNDLE") == original
+
+
+class TestHeaderProvider:
+    """Verify FeastMLflowHeaderProvider plugin behaviour."""
+
+    def test_in_context_false_when_no_token(self):
+        from feast.infra.data_sources.mlflow.auth import FeastMLflowHeaderProvider
+
+        provider = FeastMLflowHeaderProvider()
+        assert not provider.in_context()
+
+    def test_in_context_true_with_token(self):
+        from feast.infra.data_sources.mlflow.auth import (
+            FeastMLflowHeaderProvider,
+            mlflow_token_scope,
+        )
+
+        provider = FeastMLflowHeaderProvider()
+        with mlflow_token_scope("test-token"):
+            assert provider.in_context()
+            headers = provider.request_headers()
+            assert headers == {"Authorization": "Bearer test-token"}
+
+    def test_headers_empty_without_token(self):
+        from feast.infra.data_sources.mlflow.auth import FeastMLflowHeaderProvider
+
+        provider = FeastMLflowHeaderProvider()
+        assert provider.request_headers() == {}
