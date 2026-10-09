@@ -462,6 +462,36 @@ spec:
           - subjectaccessreviews
           verbs:
           - create
+        - apiGroups:
+          - dataregistry.opendatahub.io
+          resources:
+          - registries
+          - namespaces
+          - tables
+          - volumes
+          - generic-tables
+          verbs:
+          - get
+          - list
+          - watch
+          - create
+          - update
+          - patch
+          - delete
+        - apiGroups:
+          - dataregistry.opendatahub.io
+          resources:
+          - connections
+          verbs:
+          - use
+        - apiGroups:
+          - rbac.authorization.k8s.io
+          resourceNames:
+          - system:auth-delegator
+          resources:
+          - clusterroles
+          verbs:
+          - bind
         serviceAccountName: feast-operator-controller-manager
       deployments:
       - label:
